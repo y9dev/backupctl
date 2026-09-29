@@ -1,5 +1,5 @@
-backupctl
-backupctl.exe
+/backupctl
+/backupctl.exe
 out.txt
 .env
 backups/
