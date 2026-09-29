@@ -1,0 +1,8 @@
+backupctl
+backupctl.exe
+out.txt
+.env
+backups/
+testdata/
+configs/conf.yaml
+configs/secrets.yaml
