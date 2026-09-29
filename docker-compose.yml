@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: production
+      POSTGRES_USER: backup
+      POSTGRES_PASSWORD: backup
+    ports:
+      - "5432:5432"
+  sshd:
+    image: linuxserver/openssh-server:latest
+    environment:
+      PASSWORD_ACCESS: "true"
+      USER_NAME: backup
+      USER_PASSWORD: backup
+    ports:
+      - "2222:2222"
+    volumes:
+      - ./testdata:/data

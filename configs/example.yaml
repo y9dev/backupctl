@@ -1,0 +1,68 @@
+storage:
+  path: /var/backups
+  min_free_space: 10GB
+database:
+  path: /var/lib/backupctl/backup.db
+scheduler:
+  max_parallel_jobs: 4
+retention:
+  hourly:
+    count: 10
+    window: 12h
+  weekly:
+    count: 1
+    window: 168h
+  monthly:
+    count: 2
+    window: 720h
+timezone: ""
+retry:
+  attempts: 3
+  delay: 30s
+servers:
+  - name: prod-1
+    host: 192.168.1.10
+    port: 22
+    username: backup
+    ssh_key: /root/.ssh/id_ed25519
+    enabled: true
+    jobs:
+      - name: app
+        type: directory
+        enabled: true
+        schedule: "0 * * * *"
+        timeout: 2h
+        config:
+          source: /opt/app
+          compression:
+            type: zstd
+            level: 3
+          exclude:
+            - /opt/app/node_modules
+      - name: postgres
+        type: postgresql
+        enabled: true
+        schedule: "0 * * * *"
+        timeout: 2h
+        config:
+          host: 127.0.0.1
+          port: 5432
+          database: production
+          username: backup
+          password_secret: postgres_prod
+      # Пример: PostgreSQL в Docker-контейнере на удалённом хосте.
+      # pg_dump выполняется внутри контейнера через `docker exec`,
+      # stdout так же стримится по SSH на backup-сервер.
+      # - name: postgres-docker
+      #   type: postgresql
+      #   enabled: true
+      #   schedule: "0 * * * *"
+      #   timeout: 2h
+      #   config:
+      #     container: pg-production   # имя контейнера на удалённом хосте
+      #     # docker: /usr/bin/docker  # путь к docker, по умолчанию "docker"
+      #     host: 127.0.0.1            # host/port/user внутри контейнера
+      #     port: 5432
+      #     database: production
+      #     username: backup
+      #     password_secret: postgres_prod
