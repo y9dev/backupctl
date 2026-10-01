@@ -91,7 +91,7 @@ func syncConfigToDB(c *config.Config, db *database.DB) error {
 		if s.Enabled != nil {
 			en = *s.Enabled
 		}
-		id, err := db.UpsertServer(models.Server{Name: s.Name, Host: s.Host, Port: s.Port, Username: s.Username, SSHKey: s.SSHKey, Enabled: en})
+		id, err := db.UpsertServer(models.Server{Name: s.Name, Host: s.Host, Port: s.Port, Username: s.Username, SSHKey: s.SSHKey, Local: s.Local, Enabled: en})
 		if err != nil {
 			return err
 		}
@@ -181,7 +181,11 @@ func serverCmd() *cobra.Command {
 				if !srv.Enabled {
 					st = "DISABLED"
 				}
-				fmt.Printf("%-15s %-20s %-5d %-8s\n", srv.Name, srv.Host, len(jobs), st)
+				host := srv.Host
+				if srv.Local {
+					host = "local"
+				}
+				fmt.Printf("%-15s %-20s %-5d %-8s\n", srv.Name, host, len(jobs), st)
 			}
 			return nil
 		}},
@@ -200,6 +204,10 @@ func serverCmd() *cobra.Command {
 			srv, err := db.GetServerByName(args[0])
 			if err != nil {
 				return fail(1, err)
+			}
+			if srv.Local {
+				fmt.Println("[✓] Local server — no SSH needed, jobs run on this machine")
+				return nil
 			}
 			if err := testSSHWithTrust(srv, trust); err != nil {
 				fmt.Println("[x] Connection failed:", err)

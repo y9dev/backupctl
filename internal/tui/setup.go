@@ -130,24 +130,36 @@ func RunSetupWizard(cfgPath string) error {
 	_ = mw
 	// server
 	fmt.Println("--- Add server ---")
+	fmt.Println("Where will backups run? 1) Remote server via SSH  2) This machine (local)")
+	locChoice := prompt(r, "Choice", "1")
+	isLocal := strings.TrimSpace(locChoice) == "2"
 	sname := prompt(r, "Server name", "prod-1")
-	host := prompt(r, "Host", "")
-	portStr := prompt(r, "SSH port", "22")
-	user := prompt(r, "Username", "backup")
-	key := promptExistingFile(r, "SSH key", defaultSSHKey())
-	fmt.Printf("    -> %s\n", absHint(key))
+	var host, user, key string
 	port := 22
-	fmt.Sscanf(portStr, "%d", &port)
+	if isLocal {
+		fmt.Println("Local mode: jobs run directly on this machine, no SSH needed.")
+	} else {
+		host = prompt(r, "Host", "")
+		portStr := prompt(r, "SSH port", "22")
+		user = prompt(r, "Username", "backup")
+		key = promptExistingFile(r, "SSH key", defaultSSHKey())
+		fmt.Printf("    -> %s\n", absHint(key))
+		fmt.Sscanf(portStr, "%d", &port)
+	}
 	en := true
-	srv := config.ServerConfig{Name: sname, Host: host, Port: port, Username: user, SSHKey: key, Enabled: &en}
+	srv := config.ServerConfig{Name: sname, Host: host, Port: port, Username: user, SSHKey: key, Local: isLocal, Enabled: &en}
 
 	// test SSH (с trust-flow: при неизвестном host key спрашиваем fingerprint)
-	fmt.Println("Testing connection...")
-	if err := testConnWizard(r, srv); err != nil {
-		fmt.Println("[x] Connection failed:", err)
-		fmt.Println("Fix settings in config later with `backupctl tui`.")
+	if isLocal {
+		fmt.Println("[✓] Local server — connection test skipped (no SSH)")
 	} else {
-		fmt.Println("[✓] Connection successful")
+		fmt.Println("Testing connection...")
+		if err := testConnWizard(r, srv); err != nil {
+			fmt.Println("[x] Connection failed:", err)
+			fmt.Println("Fix settings in config later with `backupctl tui`.")
+		} else {
+			fmt.Println("[✓] Connection successful")
+		}
 	}
 
 	// first job
@@ -176,7 +188,11 @@ func RunSetupWizard(cfgPath string) error {
 		if pgWhere == "2" {
 			container := prompt(r, "Docker container name", "postgres")
 			jcfg["container"] = container
-			fmt.Println("pg_dump will run inside the container via `docker exec` on the remote host.")
+			if isLocal {
+				fmt.Println("pg_dump will run inside the container via `docker exec` on this machine.")
+			} else {
+				fmt.Println("pg_dump will run inside the container via `docker exec` on the remote host.")
+			}
 		}
 	case "3":
 		jtype = "command"
@@ -220,7 +236,7 @@ func RunSetupWizard(cfgPath string) error {
 		return err
 	}
 	defer db.Close()
-	id, err := db.UpsertServer(models.Server{Name: srv.Name, Host: srv.Host, Port: srv.Port, Username: srv.Username, SSHKey: srv.SSHKey, Enabled: true})
+	id, err := db.UpsertServer(models.Server{Name: srv.Name, Host: srv.Host, Port: srv.Port, Username: srv.Username, SSHKey: srv.SSHKey, Local: srv.Local, Enabled: true})
 	if err != nil {
 		return err
 	}

@@ -38,7 +38,7 @@ func (d *DB) Close() error { return d.SQL.Close() }
 
 func (d *DB) migrate() error {
 	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS servers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 22, username TEXT NOT NULL, ssh_key TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS servers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, host TEXT NOT NULL DEFAULT '', port INTEGER NOT NULL DEFAULT 22, username TEXT NOT NULL DEFAULT '', ssh_key TEXT NOT NULL DEFAULT '', local INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS backup_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE, name TEXT NOT NULL, type TEXT NOT NULL, schedule TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, timeout TEXT NOT NULL DEFAULT '', config_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(server_id, name))`,
 		`CREATE TABLE IF NOT EXISTS backup_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER NOT NULL, server_id INTEGER NOT NULL, started_at TEXT NOT NULL, finished_at TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, backup_path TEXT NOT NULL DEFAULT '', backup_size INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '')`,
 		`CREATE TABLE IF NOT EXISTS backups (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER NOT NULL, server_id INTEGER NOT NULL, path TEXT NOT NULL, created_at TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0, checksum TEXT NOT NULL DEFAULT '')`,
@@ -50,7 +50,47 @@ func (d *DB) migrate() error {
 			return fmt.Errorf("migrate: %w", err)
 		}
 	}
+	// Backward-compatible schema upgrades for DBs created before a column existed.
+	if err := d.ensureColumn("servers", "local", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := d.ensureColumn("servers", "ssh_key", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	// Older DBs declared host/username NOT NULL without default; relax by
+	// ensuring new rows can store empty values for local servers. SQLite cannot
+	// alter NOT NULL directly, but empty-string defaults on insert are handled
+	// in code; nothing more needed here.
 	return nil
+}
+
+func (d *DB) ensureColumn(table, column, ddlType string) error {
+	rows, err := d.SQL.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, pk int
+		var dflt any
+		var extra any
+		// PRAGMA table_info returns 6 columns; scan tolerantly.
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			// fallback: try scanning with extra
+			_ = extra
+			return err
+		}
+		if name == column {
+			return rows.Err()
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = d.SQL.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, ddlType))
+	return err
 }
 
 func nowUTC() string { return time.Now().UTC().Format(time.RFC3339Nano) }
@@ -62,8 +102,8 @@ func (d *DB) UpsertServer(s models.Server) (int64, error) {
 	var id int64
 	err := d.SQL.QueryRow(`SELECT id FROM servers WHERE name=?`, s.Name).Scan(&id)
 	if err == sql.ErrNoRows {
-		res, err := d.SQL.Exec(`INSERT INTO servers(name,host,port,username,ssh_key,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`,
-			s.Name, s.Host, s.Port, s.Username, s.SSHKey, boolToInt(s.Enabled), now, now)
+		res, err := d.SQL.Exec(`INSERT INTO servers(name,host,port,username,ssh_key,local,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+			s.Name, s.Host, s.Port, s.Username, s.SSHKey, boolToInt(s.Local), boolToInt(s.Enabled), now, now)
 		if err != nil {
 			return 0, err
 		}
@@ -72,13 +112,13 @@ func (d *DB) UpsertServer(s models.Server) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	_, err = d.SQL.Exec(`UPDATE servers SET host=?,port=?,username=?,ssh_key=?,enabled=?,updated_at=? WHERE id=?`,
-		s.Host, s.Port, s.Username, s.SSHKey, boolToInt(s.Enabled), now, id)
+	_, err = d.SQL.Exec(`UPDATE servers SET host=?,port=?,username=?,ssh_key=?,local=?,enabled=?,updated_at=? WHERE id=?`,
+		s.Host, s.Port, s.Username, s.SSHKey, boolToInt(s.Local), boolToInt(s.Enabled), now, id)
 	return id, err
 }
 
 func (d *DB) ListServers() ([]models.Server, error) {
-	rows, err := d.SQL.Query(`SELECT id,name,host,port,username,ssh_key,enabled,created_at,updated_at FROM servers ORDER BY name`)
+	rows, err := d.SQL.Query(`SELECT id,name,host,port,username,ssh_key,local,enabled,created_at,updated_at FROM servers ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -86,11 +126,12 @@ func (d *DB) ListServers() ([]models.Server, error) {
 	var out []models.Server
 	for rows.Next() {
 		var s models.Server
-		var en int
+		var en, loc int
 		var ca, ua string
-		if err := rows.Scan(&s.ID, &s.Name, &s.Host, &s.Port, &s.Username, &s.SSHKey, &en, &ca, &ua); err != nil {
+		if err := rows.Scan(&s.ID, &s.Name, &s.Host, &s.Port, &s.Username, &s.SSHKey, &loc, &en, &ca, &ua); err != nil {
 			return nil, err
 		}
+		s.Local = loc == 1
 		s.Enabled = en == 1
 		s.CreatedAt, _ = time.Parse(time.RFC3339Nano, ca)
 		s.UpdatedAt, _ = time.Parse(time.RFC3339Nano, ua)
@@ -101,13 +142,14 @@ func (d *DB) ListServers() ([]models.Server, error) {
 
 func (d *DB) GetServerByName(name string) (models.Server, error) {
 	var s models.Server
-	var en int
+	var en, loc int
 	var ca, ua string
-	err := d.SQL.QueryRow(`SELECT id,name,host,port,username,ssh_key,enabled,created_at,updated_at FROM servers WHERE name=?`, name).
-		Scan(&s.ID, &s.Name, &s.Host, &s.Port, &s.Username, &s.SSHKey, &en, &ca, &ua)
+	err := d.SQL.QueryRow(`SELECT id,name,host,port,username,ssh_key,local,enabled,created_at,updated_at FROM servers WHERE name=?`, name).
+		Scan(&s.ID, &s.Name, &s.Host, &s.Port, &s.Username, &s.SSHKey, &loc, &en, &ca, &ua)
 	if err != nil {
 		return s, err
 	}
+	s.Local = loc == 1
 	s.Enabled = en == 1
 	s.CreatedAt, _ = time.Parse(time.RFC3339Nano, ca)
 	s.UpdatedAt, _ = time.Parse(time.RFC3339Nano, ua)
@@ -333,13 +375,14 @@ func (d *DB) GetJobByID(id int64) (models.BackupJob, error) {
 
 func (d *DB) GetServerByID(id int64) (models.Server, error) {
 	var s models.Server
-	var en int
+	var en, loc int
 	var ca, ua string
-	err := d.SQL.QueryRow(`SELECT id,name,host,port,username,ssh_key,enabled,created_at,updated_at FROM servers WHERE id=?`, id).
-		Scan(&s.ID, &s.Name, &s.Host, &s.Port, &s.Username, &s.SSHKey, &en, &ca, &ua)
+	err := d.SQL.QueryRow(`SELECT id,name,host,port,username,ssh_key,local,enabled,created_at,updated_at FROM servers WHERE id=?`, id).
+		Scan(&s.ID, &s.Name, &s.Host, &s.Port, &s.Username, &s.SSHKey, &loc, &en, &ca, &ua)
 	if err != nil {
 		return s, err
 	}
+	s.Local = loc == 1
 	s.Enabled = en == 1
 	return s, nil
 }

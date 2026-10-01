@@ -105,7 +105,11 @@ func (m *model) refresh() {
 		if !s.Enabled {
 			st = "DISABLED"
 		}
-		m.servers = append(m.servers, serverRow{s.Name, s.Host, len(jobs), st})
+		host := s.Host
+		if s.Local {
+			host = "local"
+		}
+		m.servers = append(m.servers, serverRow{s.Name, host, len(jobs), st})
 	}
 	jobs, _ := m.db.ListJobs(0)
 	m.jobs = nil

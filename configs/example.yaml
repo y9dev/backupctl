@@ -66,3 +66,41 @@ servers:
       #     database: production
       #     username: backup
       #     password_secret: postgres_prod
+  # Бэкап непосредственно на этой машине, без SSH.
+  # host/username/ssh_key не нужны и игнорируются.
+  # Все типы job'ов (directory, postgresql, command) работают так же,
+  # команды выполняются локально (tar/pg_dump/docker должны быть установлены).
+  - name: local
+    local: true
+    enabled: true
+    jobs:
+      - name: app
+        type: directory
+        enabled: true
+        schedule: "0 * * * *"
+        timeout: 2h
+        config:
+          source: /opt/app
+          compression:
+            type: zstd
+            level: 3
+      - name: postgres
+        type: postgresql
+        enabled: true
+        schedule: "0 * * * *"
+        timeout: 2h
+        config:
+          host: 127.0.0.1
+          port: 5432
+          database: production
+          username: backup
+          password_secret: postgres_prod
+          # container: pg-production  # pg_dump внутри локального docker-контейнера
+      - name: custom
+        type: command
+        enabled: true
+        schedule: "0 * * * *"
+        timeout: 2h
+        config:
+          command: [/usr/local/bin/create-backup.sh]
+          output: {type: stdout, filename: output.bin}

@@ -39,10 +39,11 @@ type RetentionConfig struct {
 
 type ServerConfig struct {
 	Name     string      `yaml:"name"`
-	Host     string      `yaml:"host"`
-	Port     int         `yaml:"port"`
-	Username string      `yaml:"username"`
-	SSHKey   string      `yaml:"ssh_key"`
+	Host     string      `yaml:"host,omitempty"`
+	Port     int         `yaml:"port,omitempty"`
+	Username string      `yaml:"username,omitempty"`
+	SSHKey   string      `yaml:"ssh_key,omitempty"`
+	Local    bool        `yaml:"local,omitempty"`
 	Enabled  *bool       `yaml:"enabled"`
 	Jobs     []JobConfig `yaml:"jobs"`
 }
@@ -172,6 +173,8 @@ func (c *Config) normalize() error {
 			v := true
 			s.Enabled = &v
 		}
+		// Local servers don't need SSH connection details; keep port default
+		// for display but don't require host/username/key (checked in Validate).
 		for j := range s.Jobs {
 			jb := &s.Jobs[j]
 			if jb.Enabled == nil {
@@ -249,6 +252,16 @@ func parseBytes(s string) (int64, error) {
 
 var validTypes = map[string]bool{"directory": true, "postgresql": true, "postgres": true, "command": true}
 
+// expandUser expands leading ~/ and env vars for validation (matches TUI wizard behavior).
+func expandUser(p string) string {
+	if len(p) >= 2 && p[0] == '~' && (p[1] == '/' || p[1] == '\\') {
+		if h, err := os.UserHomeDir(); err == nil && h != "" {
+			p = filepath.Join(h, p[2:])
+		}
+	}
+	return os.ExpandEnv(p)
+}
+
 func (c *Config) Validate() error {
 	if c.Storage.Path == "" {
 		return fmt.Errorf("storage.path is required")
@@ -271,17 +284,27 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("duplicate server name %q", s.Name)
 		}
 		seen[s.Name] = true
-		if s.Host == "" {
-			return fmt.Errorf("server %q: host is required", s.Name)
-		}
-		if s.Username == "" {
-			return fmt.Errorf("server %q: username is required", s.Name)
-		}
-		if s.SSHKey != "" {
-			if _, err := os.Stat(s.SSHKey); err != nil {
-				// only error if file:// path exists check fails AND config file exists on disk?
-				// For validation strictness keep error, but allow missing in tests via env? Keep error.
-				return fmt.Errorf("server %q: ssh_key %q: %w", s.Name, s.SSHKey, err)
+		if s.Local {
+			// Local mode: backup runs directly on this machine, no SSH.
+			// Host/username/key are not required and are ignored.
+			if s.SSHKey != "" {
+				if _, err := os.Stat(expandUser(s.SSHKey)); err != nil {
+					return fmt.Errorf("server %q: ssh_key %q: %w", s.Name, s.SSHKey, err)
+				}
+			}
+		} else {
+			if s.Host == "" {
+				return fmt.Errorf("server %q: host is required (or set local: true for on-machine backups)", s.Name)
+			}
+			if s.Username == "" {
+				return fmt.Errorf("server %q: username is required", s.Name)
+			}
+			if s.SSHKey != "" {
+				if _, err := os.Stat(expandUser(s.SSHKey)); err != nil {
+					// only error if file:// path exists check fails AND config file exists on disk?
+					// For validation strictness keep error, but allow missing in tests via env? Keep error.
+					return fmt.Errorf("server %q: ssh_key %q: %w", s.Name, s.SSHKey, err)
+				}
 			}
 		}
 		jseen := map[string]bool{}

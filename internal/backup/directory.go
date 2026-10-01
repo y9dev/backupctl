@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -62,14 +63,8 @@ func (DirectoryProvider) Backup(ctx context.Context, server Server, job Job, des
 		follow = f
 	}
 
-	client, err := sshclient.Dial(sshclient.ServerInfo{Host: server.Host, Port: server.Port, Username: server.Username, KeyPath: server.SSHKey})
-	if err != nil {
-		return BackupResult{}, fmt.Errorf("ssh connect: %w", err)
-	}
-	defer client.Close()
-
-	// Build remote tar command: tar -c [opts] -C / source...
-	// Use tar to stdout. Avoid shell interpolation: pass argv, sshclient escapes.
+	// Build tar command: tar -c [opts] source...
+	// Local and remote use the same argv; only the transport differs.
 	argv := []string{"tar", "-c", "--posix"}
 	if follow {
 		argv = append(argv, "-h")
@@ -99,11 +94,23 @@ func (DirectoryProvider) Backup(ctx context.Context, server Server, job Job, des
 	if err != nil {
 		return BackupResult{}, err
 	}
-	stderr, runErr := sshclient.Run(ctx, client, argv, enc)
+	var stderr string
+	var runErr error
+	if IsLocal(server) {
+		stderr, runErr = runLocal(ctx, argv, enc)
+	} else {
+		c, err := sshclient.Dial(sshclient.ServerInfo{Host: server.Host, Port: server.Port, Username: server.Username, KeyPath: server.SSHKey})
+		if err != nil {
+			_ = enc.Close()
+			return BackupResult{}, fmt.Errorf("ssh connect: %w", err)
+		}
+		defer c.Close()
+		stderr, runErr = sshclient.Run(ctx, c, argv, enc)
+	}
 	_ = enc.Close()
 	if runErr != nil {
 		// include stderr but never secrets
-		return BackupResult{}, fmt.Errorf("remote tar failed: %v: %s", runErr, truncate(stderr, 2000))
+		return BackupResult{}, fmt.Errorf("tar failed: %v: %s", runErr, truncate(stderr, 2000))
 	}
 	// empty check: tar of empty dir still produces headers, but zero-byte means failure
 	checksum, size, err := func() (string, int64, error) {
@@ -132,6 +139,9 @@ func (DirectoryProvider) Restore(ctx context.Context, server Server, job Job, ba
 	if dest == "" {
 		return fmt.Errorf("restore destination is required")
 	}
+	if IsLocal(server) {
+		return restoreDirectoryLocal(ctx, backup.Path, dest)
+	}
 	client, err := sshclient.Dial(sshclient.ServerInfo{Host: server.Host, Port: server.Port, Username: server.Username, KeyPath: server.SSHKey})
 	if err != nil {
 		return err
@@ -150,4 +160,38 @@ func truncate(s string, n int) string {
 		return s[:n]
 	}
 	return s
+}
+
+// restoreDirectoryLocal extracts a .tar.zst backup into dest on this machine:
+// mkdir -p dest, then decompress the file and pipe the tar stream into
+// `tar -x -C dest`. Uses the local tar binary, same requirement as remote.
+func restoreDirectoryLocal(ctx context.Context, backupPath, dest string) error {
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		return err
+	}
+	f, err := os.Open(backupPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	cmd := exec.CommandContext(ctx, "tar", "-x", "-C", dest)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("tar -x: %w", err)
+	}
+	copyErr := decompressZstdToWriter(f, stdin)
+	_ = stdin.Close()
+	waitErr := cmd.Wait()
+	if copyErr != nil {
+		return copyErr
+	}
+	if waitErr != nil {
+		return fmt.Errorf("tar -x failed: %v: %s", waitErr, truncate(stderr.String(), 2000))
+	}
+	return nil
 }

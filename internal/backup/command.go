@@ -55,6 +55,33 @@ func (CommandProvider) Backup(ctx context.Context, server Server, job Job, desti
 		}
 	}
 	_ = filename
+	if IsLocal(server) {
+		final := destination
+		aw, err := storage.NewAtomicWriter(final)
+		if err != nil {
+			return BackupResult{}, err
+		}
+		committed := false
+		defer func() {
+			if !committed {
+				aw.Abort()
+			}
+		}()
+		stderr, runErr := runLocal(ctx, argv, aw)
+		if runErr != nil {
+			return BackupResult{}, fmt.Errorf("local command failed: %v: %s", runErr, truncate(stderr, 2000))
+		}
+		sum, sz, err := aw.Commit()
+		if err != nil {
+			return BackupResult{}, err
+		}
+		committed = true
+		if sz == 0 {
+			os.Remove(final)
+			return BackupResult{}, fmt.Errorf("command produced empty output")
+		}
+		return BackupResult{Path: final, Size: sz, Checksum: sum, CreatedAt: time.Now().UTC()}, nil
+	}
 	client, err := sshclient.Dial(sshclient.ServerInfo{Host: server.Host, Port: server.Port, Username: server.Username, KeyPath: server.SSHKey})
 	if err != nil {
 		return BackupResult{}, fmt.Errorf("ssh connect: %w", err)

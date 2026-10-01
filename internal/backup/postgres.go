@@ -211,14 +211,8 @@ func (PostgresProvider) Backup(ctx context.Context, server Server, job Job, dest
 	if s.Database == "" || s.Username == "" {
 		return BackupResult{}, fmt.Errorf("postgresql provider: database and username are required")
 	}
-	client, err := sshclient.Dial(sshclient.ServerInfo{Host: server.Host, Port: server.Port, Username: server.Username, KeyPath: server.SSHKey})
-	if err != nil {
-		return BackupResult{}, fmt.Errorf("ssh connect: %w", err)
-	}
-	defer client.Close()
-
 	// При container != "": pg_dump выполняется внутри Docker-контейнера
-	// через `docker exec` на удалённом хосте, stdout так же стримится по SSH.
+	// через `docker exec` (на удалённом хосте по SSH или локально), stdout стримится в файл.
 	argv := buildDumpArgv(s)
 
 	final := destination
@@ -235,7 +229,18 @@ func (PostgresProvider) Backup(ctx context.Context, server Server, job Job, dest
 			aw.Abort()
 		}
 	}()
-	stderr, runErr := sshclient.Run(ctx, client, argv, aw)
+	var stderr string
+	var runErr error
+	if IsLocal(server) {
+		stderr, runErr = runLocal(ctx, argv, aw)
+	} else {
+		client, err := sshclient.Dial(sshclient.ServerInfo{Host: server.Host, Port: server.Port, Username: server.Username, KeyPath: server.SSHKey})
+		if err != nil {
+			return BackupResult{}, fmt.Errorf("ssh connect: %w", err)
+		}
+		defer client.Close()
+		stderr, runErr = sshclient.Run(ctx, client, argv, aw)
+	}
 	if runErr != nil {
 		return BackupResult{}, fmt.Errorf("pg_dump failed: %v: %s", runErr, truncate(stderr, 2000))
 	}
@@ -260,6 +265,19 @@ func (PostgresProvider) Restore(ctx context.Context, server Server, job Job, bac
 	if db == "" {
 		return fmt.Errorf("database is required")
 	}
+	var argv = buildRestoreArgv(s, db)
+	if IsLocal(server) {
+		f, err := os.Open(backup.Path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		stderr, err := runLocalWithStdin(ctx, argv, f)
+		if err != nil {
+			return fmt.Errorf("pg_restore failed: %v: %s", err, truncate(stderr, 2000))
+		}
+		return nil
+	}
 	client, err := sshclient.Dial(sshclient.ServerInfo{Host: server.Host, Port: server.Port, Username: server.Username, KeyPath: server.SSHKey})
 	if err != nil {
 		return err
@@ -279,7 +297,6 @@ func (PostgresProvider) Restore(ctx context.Context, server Server, job Job, bac
 	if err != nil {
 		return err
 	}
-	var argv = buildRestoreArgv(s, db)
 	// start remote via escaped command: rebuild using shellEscape-like quoting through Run? Instead run directly:
 	// Use sess with env: we need to pass through sshclient escaping; simplest: use sshclient.Run-like start.
 	// Build command string manually with quoting.
