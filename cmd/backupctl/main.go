@@ -338,8 +338,15 @@ func jobCmd() *cobra.Command {
 
 func backupCmd() *cobra.Command {
 	b := &cobra.Command{Use: "backup", Short: "Backups"}
-	b.AddCommand(
-		&cobra.Command{Use: "list", RunE: func(cmd *cobra.Command, args []string) error {
+	listCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List backups (paginated)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			serverName, _ := cmd.Flags().GetString("server")
+			jobName, _ := cmd.Flags().GetString("job")
+			page, _ := cmd.Flags().GetInt("page")
+			perPage, _ := cmd.Flags().GetInt("per-page")
+			page, perPage = normalizeHistoryPage(page, perPage)
 			c, err := loadCfg()
 			if err != nil {
 				return fail(2, err)
@@ -349,15 +356,85 @@ func backupCmd() *cobra.Command {
 				return fail(1, err)
 			}
 			defer db.Close()
-			list, _ := db.ListBackups(0, 50)
+			jobID, serverID, err := resolveHistoryFilter(db, serverName, jobName)
+			if err != nil {
+				return fail(1, err)
+			}
+			total, err := db.CountBackups(jobID, serverID)
+			if err != nil {
+				return fail(1, err)
+			}
+			list, err := db.ListBackupsPaged(database.BackupFilter{
+				JobID: jobID, ServerID: serverID,
+				Limit: perPage, Offset: (page - 1) * perPage,
+			})
+			if err != nil {
+				return fail(1, err)
+			}
 			fmt.Printf("%-5s %-19s %-12s %-12s %-10s\n", "ID", "TIME", "SERVER", "JOB", "SIZE")
 			for _, bk := range list {
 				srv, _ := db.GetServerByID(bk.ServerID)
 				jb, _ := db.GetJobByID(bk.JobID)
 				fmt.Printf("%-5d %-19s %-12s %-12s %-10s\n", bk.ID, bk.CreatedAt.Local().Format("02.01 15:04"), srv.Name, jb.Name, storage.FormatSize(bk.Size))
 			}
+			fmt.Println(historyFooter(page, perPage, total))
 			return nil
-		}},
+		}}
+	listCmd.Flags().String("server", "", "filter by server name")
+	listCmd.Flags().String("job", "", "filter by job name (add --server if ambiguous)")
+	listCmd.Flags().Int("page", 1, "page number (1-based)")
+	listCmd.Flags().Int("per-page", 20, "entries per page (1-100)")
+	runsCmd := &cobra.Command{
+		Use:   "runs",
+		Short: "List backup run history (paginated)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			serverName, _ := cmd.Flags().GetString("server")
+			jobName, _ := cmd.Flags().GetString("job")
+			status, _ := cmd.Flags().GetString("status")
+			page, _ := cmd.Flags().GetInt("page")
+			perPage, _ := cmd.Flags().GetInt("per-page")
+			page, perPage = normalizeHistoryPage(page, perPage)
+			c, err := loadCfg()
+			if err != nil {
+				return fail(2, err)
+			}
+			db, err := openDB(c)
+			if err != nil {
+				return fail(1, err)
+			}
+			defer db.Close()
+			jobID, serverID, err := resolveHistoryFilter(db, serverName, jobName)
+			if err != nil {
+				return fail(1, err)
+			}
+			total, err := db.CountRuns(jobID, serverID, status)
+			if err != nil {
+				return fail(1, err)
+			}
+			runs, err := db.ListRunsPaged(database.RunFilter{
+				JobID: jobID, ServerID: serverID, Status: status,
+				Limit: perPage, Offset: (page - 1) * perPage,
+			})
+			if err != nil {
+				return fail(1, err)
+			}
+			fmt.Printf("%-5s %-19s %-12s %-12s %-10s %-9s\n", "ID", "STARTED", "SERVER", "JOB", "SIZE", "STATUS")
+			for _, r := range runs {
+				srv, _ := db.GetServerByID(r.ServerID)
+				jb, _ := db.GetJobByID(r.JobID)
+				fmt.Printf("%-5d %-19s %-12s %-12s %-10s %-9s\n", r.ID, r.StartedAt.Local().Format("02.01 15:04"), srv.Name, jb.Name, storage.FormatSize(r.BackupSize), string(r.Status))
+			}
+			fmt.Println(historyFooter(page, perPage, total))
+			return nil
+		}}
+	runsCmd.Flags().String("server", "", "filter by server name")
+	runsCmd.Flags().String("job", "", "filter by job name (add --server if ambiguous)")
+	runsCmd.Flags().String("status", "", "filter by status (running|success|failed|cancelled)")
+	runsCmd.Flags().Int("page", 1, "page number (1-based)")
+	runsCmd.Flags().Int("per-page", 20, "entries per page (1-100)")
+	b.AddCommand(
+		listCmd,
+		runsCmd,
 		&cobra.Command{Use: "verify <id>", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := loadCfg()
 			if err != nil {
@@ -432,9 +509,9 @@ func backupCmd() *cobra.Command {
 			return nil
 		}},
 	)
-	b.Commands()[2].Flags().String("dest", "", "restore destination (directory jobs)")
-	b.Commands()[2].Flags().String("database", "", "target database (postgres jobs)")
-	b.Commands()[2].Flags().Bool("yes", false, "skip confirmation")
+	b.Commands()[3].Flags().String("dest", "", "restore destination (directory jobs)")
+	b.Commands()[3].Flags().String("database", "", "target database (postgres jobs)")
+	b.Commands()[3].Flags().Bool("yes", false, "skip confirmation")
 	// alias: backupctl restore <id>
 	return b
 }
