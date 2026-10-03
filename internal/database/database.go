@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"backupctl/internal/models"
@@ -286,16 +287,45 @@ func (d *DB) AddBackup(jobID, serverID int64, path string, size int64, checksum 
 	return res.LastInsertId()
 }
 
+// BackupFilter selects a page of the backup history (newest first).
+// Limit <= 0 means no limit; Offset < 0 is treated as 0.
+type BackupFilter struct {
+	JobID    int64
+	ServerID int64
+	Limit    int
+	Offset   int
+}
+
 func (d *DB) ListBackups(jobID int64, limit int) ([]models.Backup, error) {
+	return d.ListBackupsPaged(BackupFilter{JobID: jobID, Limit: limit})
+}
+
+// ListBackupsPaged returns one page of backups with optional job/server filters.
+func (d *DB) ListBackupsPaged(f BackupFilter) ([]models.Backup, error) {
 	q := `SELECT id,job_id,server_id,path,created_at,size,checksum FROM backups`
+	var conds []string
 	var args []any
-	if jobID != 0 {
-		q += ` WHERE job_id=?`
-		args = append(args, jobID)
+	if f.JobID != 0 {
+		conds = append(conds, `job_id=?`)
+		args = append(args, f.JobID)
 	}
-	q += ` ORDER BY created_at DESC`
-	if limit > 0 {
-		q += fmt.Sprintf(` LIMIT %d`, limit)
+	if f.ServerID != 0 {
+		conds = append(conds, `server_id=?`)
+		args = append(args, f.ServerID)
+	}
+	if len(conds) > 0 {
+		q += ` WHERE ` + strings.Join(conds, ` AND `)
+	}
+	// id DESC tie-break keeps pagination stable for equal timestamps.
+	q += ` ORDER BY created_at DESC, id DESC`
+	if f.Limit > 0 {
+		q += fmt.Sprintf(` LIMIT %d`, f.Limit)
+	}
+	if f.Offset > 0 {
+		if f.Limit <= 0 {
+			q += ` LIMIT -1`
+		}
+		q += fmt.Sprintf(` OFFSET %d`, f.Offset)
 	}
 	rows, err := d.SQL.Query(q, args...)
 	if err != nil {
@@ -315,6 +345,29 @@ func (d *DB) ListBackups(jobID int64, limit int) ([]models.Backup, error) {
 	return out, rows.Err()
 }
 
+// CountBackups returns the total number of backups matching the filters.
+func (d *DB) CountBackups(jobID, serverID int64) (int, error) {
+	q := `SELECT COUNT(*) FROM backups`
+	var conds []string
+	var args []any
+	if jobID != 0 {
+		conds = append(conds, `job_id=?`)
+		args = append(args, jobID)
+	}
+	if serverID != 0 {
+		conds = append(conds, `server_id=?`)
+		args = append(args, serverID)
+	}
+	if len(conds) > 0 {
+		q += ` WHERE ` + strings.Join(conds, ` AND `)
+	}
+	var n int
+	if err := d.SQL.QueryRow(q, args...).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 func (d *DB) GetBackup(id int64) (models.Backup, error) {
 	var b models.Backup
 	var ca string
@@ -332,8 +385,49 @@ func (d *DB) DeleteBackup(id int64) error {
 	return err
 }
 
+// RunFilter selects a page of the run history (newest first).
+type RunFilter struct {
+	JobID    int64
+	ServerID int64
+	Status   string
+	Limit    int
+	Offset   int
+}
+
 func (d *DB) ListRuns(limit int) ([]models.BackupRun, error) {
-	rows, err := d.SQL.Query(`SELECT id,job_id,server_id,started_at,finished_at,status,backup_path,backup_size,error FROM backup_runs ORDER BY started_at DESC LIMIT ?`, limit)
+	return d.ListRunsPaged(RunFilter{Limit: limit})
+}
+
+// ListRunsPaged returns one page of backup runs with optional filters.
+func (d *DB) ListRunsPaged(f RunFilter) ([]models.BackupRun, error) {
+	q := `SELECT id,job_id,server_id,started_at,finished_at,status,backup_path,backup_size,error FROM backup_runs`
+	var conds []string
+	var args []any
+	if f.JobID != 0 {
+		conds = append(conds, `job_id=?`)
+		args = append(args, f.JobID)
+	}
+	if f.ServerID != 0 {
+		conds = append(conds, `server_id=?`)
+		args = append(args, f.ServerID)
+	}
+	if f.Status != "" {
+		conds = append(conds, `status=?`)
+		args = append(args, f.Status)
+	}
+	if len(conds) > 0 {
+		q += ` WHERE ` + strings.Join(conds, ` AND `)
+	}
+	q += ` ORDER BY started_at DESC, id DESC`
+	if f.Limit > 0 {
+		q += fmt.Sprintf(` LIMIT %d`, f.Limit)
+	} else if f.Offset > 0 {
+		q += ` LIMIT -1`
+	}
+	if f.Offset > 0 {
+		q += fmt.Sprintf(` OFFSET %d`, f.Offset)
+	}
+	rows, err := d.SQL.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -352,6 +446,33 @@ func (d *DB) ListRuns(limit int) ([]models.BackupRun, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// CountRuns returns the total number of runs matching the filters.
+func (d *DB) CountRuns(jobID, serverID int64, status string) (int, error) {
+	q := `SELECT COUNT(*) FROM backup_runs`
+	var conds []string
+	var args []any
+	if jobID != 0 {
+		conds = append(conds, `job_id=?`)
+		args = append(args, jobID)
+	}
+	if serverID != 0 {
+		conds = append(conds, `server_id=?`)
+		args = append(args, serverID)
+	}
+	if status != "" {
+		conds = append(conds, `status=?`)
+		args = append(args, status)
+	}
+	if len(conds) > 0 {
+		q += ` WHERE ` + strings.Join(conds, ` AND `)
+	}
+	var n int
+	if err := d.SQL.QueryRow(q, args...).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 func (d *DB) GetJobByID(id int64) (models.BackupJob, error) {
