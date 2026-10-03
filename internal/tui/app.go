@@ -40,7 +40,18 @@ type model struct {
 	servers []serverRow
 	jobs    []jobRow
 	hist    []histRow
+	// paginated history (backups or runs, newest first)
+	histMode    int // 0 = backups, 1 = runs
+	histPage    int // 1-based
+	histPerPage int
+	histTotal   int
+	histBk      []backupRow
 }
+
+const (
+	histBackups = iota
+	histRuns
+)
 
 type serverRow struct {
 	Name, Host string
@@ -54,6 +65,10 @@ type jobRow struct {
 type histRow struct {
 	ID                              int64
 	Time, Server, Job, Size, Status string
+}
+type backupRow struct {
+	ID                   int64
+	Time, Server, Job, Size string
 }
 
 func Run(cfgPath string) error {
@@ -77,7 +92,14 @@ func Run(cfgPath string) error {
 			return nil
 		}
 	}
-	m := model{cfgPath: cfgPath, menu: []string{"Servers", "Backup Jobs", "Backup History", "Run Backup", "Retention", "Settings", "Exit"}}
+	m := model{
+		cfgPath: cfgPath,
+		menu:    []string{"Servers", "Backup Jobs", "Backup History", "Run Backup", "Retention", "Settings", "Exit"},
+		// History starts on backups, page 1. loadHistory fills totals.
+		histMode:    histBackups,
+		histPage:    1,
+		histPerPage: 15,
+	}
 	if c, err := config.Load(cfgPath); err == nil {
 		m.cfg = c
 		if db, err := database.Open(c.Database.Path); err == nil {
@@ -117,13 +139,59 @@ func (m *model) refresh() {
 		srv, _ := m.db.GetServerByID(j.ServerID)
 		m.jobs = append(m.jobs, jobRow{srv.Name, j.Name, j.Type, j.Schedule, j.Enabled})
 	}
-	runs, _ := m.db.ListRuns(30)
+	m.loadHistory()
+}
+
+// loadHistory fetches one page of backups or runs (newest first).
+func (m *model) loadHistory() {
+	if m.db == nil {
+		return
+	}
+	if m.histPerPage < 1 {
+		m.histPerPage = 15
+	}
+	if m.histPage < 1 {
+		m.histPage = 1
+	}
+	offset := (m.histPage - 1) * m.histPerPage
+	if m.histMode == histBackups {
+		total, _ := m.db.CountBackups(0, 0)
+		m.histTotal = total
+		bks, _ := m.db.ListBackupsPaged(database.BackupFilter{Limit: m.histPerPage, Offset: offset})
+		m.histBk = nil
+		for _, b := range bks {
+			srv, _ := m.db.GetServerByID(b.ServerID)
+			jb, _ := m.db.GetJobByID(b.JobID)
+			m.histBk = append(m.histBk, backupRow{b.ID, b.CreatedAt.Local().Format("02.01 15:04"), srv.Name, jb.Name, fmt.Sprintf("%d", b.Size)})
+		}
+		// clamp page if total shrank
+		if pages := m.histPages(); m.histPage > pages && pages > 0 {
+			m.histPage = pages
+			m.loadHistory()
+		}
+		return
+	}
+	total, _ := m.db.CountRuns(0, 0, "")
+	m.histTotal = total
+	runs, _ := m.db.ListRunsPaged(database.RunFilter{Limit: m.histPerPage, Offset: offset})
 	m.hist = nil
 	for _, r := range runs {
 		srv, _ := m.db.GetServerByID(r.ServerID)
 		jb, _ := m.db.GetJobByID(r.JobID)
 		m.hist = append(m.hist, histRow{r.ID, r.StartedAt.Local().Format("02.01 15:04"), srv.Name, jb.Name, fmt.Sprintf("%d", r.BackupSize), string(r.Status)})
 	}
+	if pages := m.histPages(); m.histPage > pages && pages > 0 {
+		m.histPage = pages
+		m.loadHistory()
+	}
+}
+
+// histPages returns the total page count for the current history mode.
+func (m *model) histPages() int {
+	if m.histTotal == 0 || m.histPerPage <= 0 {
+		return 1
+	}
+	return (m.histTotal + m.histPerPage - 1) / m.histPerPage
 }
 
 func (m model) Init() tea.Cmd { return nil }
@@ -131,6 +199,35 @@ func (m model) Init() tea.Cmd { return nil }
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		// Paginated history controls (only on history screen).
+		if m.screen == sHistory {
+			switch msg.String() {
+			case "tab":
+				if m.histMode == histBackups {
+					m.histMode = histRuns
+				} else {
+					m.histMode = histBackups
+				}
+				m.histPage = 1
+				m.cursor = 0
+				m.loadHistory()
+				return m, nil
+			case "n", "right", "pgdown":
+				if m.histPage < m.histPages() {
+					m.histPage++
+					m.cursor = 0
+					m.loadHistory()
+				}
+				return m, nil
+			case "p", "left", "pgup":
+				if m.histPage > 1 {
+					m.histPage--
+					m.cursor = 0
+					m.loadHistory()
+				}
+				return m, nil
+			}
+		}
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -171,6 +268,9 @@ func (m model) itemCount() int {
 	case sJobs:
 		return len(m.jobs)
 	case sHistory:
+		if m.histMode == histBackups {
+			return len(m.histBk)
+		}
 		return len(m.hist)
 	default:
 		return 1
@@ -186,6 +286,7 @@ func (m model) selectCurrent() model {
 			m.screen = sJobs
 		case 2:
 			m.screen = sHistory
+			m.loadHistory()
 		case 3:
 			m.msg = "Run: backupctl job run <server> <job>  (non-interactive)"
 			m.screen = sRun
@@ -239,17 +340,34 @@ func (m model) View() string {
 			s += "(no jobs)\n"
 		}
 	case sHistory:
-		s += "ID    TIME          SERVER       JOB           SIZE        STATUS\n"
-		for i, r := range m.hist {
-			cur := "  "
-			if i == m.cursor {
-				cur = "> "
+		if m.histMode == histBackups {
+			s += fmt.Sprintf("BACKUPS  (page %d/%d, total %d)\n", m.histPage, m.histPages(), m.histTotal)
+			s += "ID    TIME          SERVER       JOB           SIZE\n"
+			for i, r := range m.histBk {
+				cur := "  "
+				if i == m.cursor {
+					cur = "> "
+				}
+				s += fmt.Sprintf("%s%-5d %-13s %-12s %-13s %s\n", cur, r.ID, r.Time, r.Server, r.Job, r.Size)
 			}
-			s += fmt.Sprintf("%s%-5d %-13s %-12s %-13s %-11s %s\n", cur, r.ID, r.Time, r.Server, r.Job, r.Size, r.Status)
+			if len(m.histBk) == 0 {
+				s += "(no backups yet)\n"
+			}
+		} else {
+			s += fmt.Sprintf("RUNS  (page %d/%d, total %d)\n", m.histPage, m.histPages(), m.histTotal)
+			s += "ID    TIME          SERVER       JOB           SIZE        STATUS\n"
+			for i, r := range m.hist {
+				cur := "  "
+				if i == m.cursor {
+					cur = "> "
+				}
+				s += fmt.Sprintf("%s%-5d %-13s %-12s %-13s %-11s %s\n", cur, r.ID, r.Time, r.Server, r.Job, r.Size, r.Status)
+			}
+			if len(m.hist) == 0 {
+				s += "(no runs yet)\n"
+			}
 		}
-		if len(m.hist) == 0 {
-			s += "(no history yet)\n"
-		}
+		s += helpStyle.Render("tab: backups/runs   n/p or ←/→: page   r: refresh") + "\n"
 	case sRun:
 		s += "Manual backup without TUI:\n  backupctl job run <server> <job>\n  backupctl job run --server <server>  (all jobs)\n"
 	}
