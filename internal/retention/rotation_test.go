@@ -38,21 +38,25 @@ func mkHourly(n int, now time.Time) []models.Backup {
 
 func keepIDs(keep map[int64]bool) map[int64]bool { return keep }
 
-// 1. Hourly rotation with frozen now: exactly 10 newest kept, rest pruned.
+// 1. Hourly rotation with frozen now: 10 hourly + daily/monthly bucket
+// representatives on top (GFS spread, not just the N newest).
 func TestRotation_HourlyExactWithFixedNow(t *testing.T) {
 	now := fixedNow()
 	bs := mkHourly(20, now)
 	keep := Select(bs, defaultPolicy(), now)
 
-	if len(keep) != 10 {
-		t.Fatalf("expected exactly 10 kept, got %d: %v", len(keep), keep)
+	// 10 hourly (IDs 1..10, ages 0..9h) + weekly daily rep (ID 11, Oct 3
+	// leftover past the hourly count) + monthly rep (ID 12, next Oct
+	// leftover). IDs 13..20 are older dups of covered day/month buckets.
+	if len(keep) != 12 {
+		t.Fatalf("expected exactly 12 kept, got %d: %v", len(keep), keep)
 	}
-	for i := 1; i <= 10; i++ {
+	for i := 1; i <= 12; i++ {
 		if !keep[int64(i)] {
-			t.Fatalf("backup %d (age %dh) must be kept", i, i-1)
+			t.Fatalf("backup %d must be kept", i)
 		}
 	}
-	for i := 11; i <= 20; i++ {
+	for i := 13; i <= 20; i++ {
 		if keep[int64(i)] {
 			t.Fatalf("backup %d must be rotated out (deleted)", i)
 		}
@@ -77,8 +81,8 @@ func TestRotation_WindowBoundaryInclusive(t *testing.T) {
 	}
 }
 
-// 3. Weekly tier protects backups beyond the hourly window
-// (union of "N newest in window", not "all in window").
+// 3. Weekly tier keeps one representative per calendar day beyond the
+// hourly window (GFS buckets), up to Count most recent days.
 func TestRotation_WeeklyUnionBeyondHourly(t *testing.T) {
 	now := fixedNow()
 	p := Policy{
@@ -88,27 +92,30 @@ func TestRotation_WeeklyUnionBeyondHourly(t *testing.T) {
 	}
 	bs := []models.Backup{
 		{ID: 1, CreatedAt: now.Add(-time.Hour)},      // inside hourly
-		{ID: 2, CreatedAt: now.Add(-20 * time.Hour)}, // outside hourly, inside weekly
-		{ID: 3, CreatedAt: now.Add(-3 * 24 * time.Hour)},
+		{ID: 2, CreatedAt: now.Add(-20 * time.Hour)}, // outside hourly, daily rep day 1
+		{ID: 3, CreatedAt: now.Add(-3 * 24 * time.Hour)}, // daily rep day 2
 		{ID: 4, CreatedAt: now.Add(-10 * 24 * time.Hour)}, // outside all
 	}
 	keep := Select(bs, p, now)
-	// hourly keeps {1}; weekly keeps 2 newest within 7d = {1,2}; union = {1,2}
+	// hourly keeps {1}; weekly keeps newest-per-day for the 2 most recent
+	// days with unprotected backups = {2, 3}; union = {1,2,3}.
 	if !keep[1] {
-		t.Fatal("ID 1 (hourly+weekly) must be kept")
+		t.Fatal("ID 1 (hourly) must be kept")
 	}
 	if !keep[2] {
-		t.Fatal("ID 2 must be kept by weekly tier despite being outside hourly window")
+		t.Fatal("ID 2 must be kept as daily representative despite being outside hourly window")
 	}
-	if keep[3] {
-		t.Fatal("ID 3 within weekly window but beyond count=2 must be deleted")
+	if !keep[3] {
+		t.Fatal("ID 3 must be kept as second daily representative (count=2)")
 	}
 	if keep[4] {
 		t.Fatal("ID 4 outside all windows must be deleted")
 	}
 }
 
-// 4. Monthly tier exhaustion: only N newest in 30d window survive.
+// 4. Monthly tier: newest one per calendar month, up to Count most recent
+// months. Same-month duplicates are pruned even if newer than kept reps
+// of other months.
 func TestRotation_MonthlyTierExhaustion(t *testing.T) {
 	now := fixedNow()
 	p := Policy{
@@ -196,6 +203,56 @@ func TestRotation_SameTimestampDeterministic(t *testing.T) {
 		}
 		if !keep[2] {
 			t.Fatalf("iter %d: tie must resolve deterministically to higher ID, got %v", i, keepIDs(keep))
+		}
+	}
+}
+
+// 12. GFS spread: weekly/monthly tiers keep one representative per
+// calendar day/month — NOT just the next-newest backups.
+// With half-hourly backups covering only the last 4.5h, daily and monthly
+// representatives must survive instead of everything older being pruned.
+func TestRotation_GFSSpreadKeepsDailyAndMonthly(t *testing.T) {
+	now := fixedNow() // 2026-10-03 12:00 UTC
+	bs := []models.Backup{}
+	add := func(id int64, tm time.Time) {
+		bs = append(bs, models.Backup{ID: id, CreatedAt: tm})
+	}
+	// 10 half-hourly backups, all today (ages 0..4.5h).
+	for i := 0; i < 10; i++ {
+		add(int64(i+1), now.Add(-time.Duration(i)*30*time.Minute))
+	}
+	add(11, time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)) // yesterday
+	add(12, time.Date(2026, 10, 1, 18, 0, 0, 0, time.UTC)) // same day, newest
+	add(13, time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)) // same day, older dup
+	add(14, time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC))
+	add(15, time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC))
+	add(16, time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC))
+	add(17, time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)) // outside 30d window
+
+	keep := Select(bs, defaultPolicy(), now)
+
+	// 10 hourly + 1 daily (Oct 2) + 2 monthly (Oct 1, Sep 30).
+	if len(keep) != 13 {
+		t.Fatalf("expected 13 kept (10 hourly + 1 daily + 2 monthly), got %d: %v", len(keep), keepIDs(keep))
+	}
+	for i := 1; i <= 10; i++ {
+		if !keep[int64(i)] {
+			t.Fatalf("hourly backup %d must be kept", i)
+		}
+	}
+	for _, id := range []int64{11, 12, 14} {
+		if !keep[id] {
+			t.Fatalf("representative backup %d must be kept (daily/monthly spread)", id)
+		}
+	}
+	// Same-day duplicate deleted even though NEWER than kept monthly rep 14:
+	// bucketing, not prefix-keeping.
+	if keep[13] {
+		t.Fatal("backup 13 (older dup of Oct 1) must be deleted, newest-per-day wins")
+	}
+	for _, id := range []int64{15, 16, 17} {
+		if keep[id] {
+			t.Fatalf("backup %d must be deleted (month quota filled / outside window)", id)
 		}
 	}
 }

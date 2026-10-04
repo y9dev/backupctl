@@ -30,7 +30,18 @@ type Result struct {
 // Overridden in tests to freeze/drive time deterministically.
 var NowFunc = func() time.Time { return time.Now().UTC() }
 
-// Select determines protected backups. Union of rules.
+// Select determines protected backups (GFS rotation).
+//
+//   - Hourly: Count newest backups within Window.
+//   - Weekly: up to Count backups within Window, newest one per calendar
+//     day (UTC), skipping hourly-kept ones — the "daily" spread.
+//   - Monthly: up to Count backups within Window, newest one per calendar
+//     month (UTC), skipping hourly- and weekly-kept ones.
+//
+// The union is kept. Plain "N newest in window" per tier would make
+// weekly/monthly dead config whenever their counts are below the hourly
+// count (they'd only re-protect the same newest backups); bucketing is
+// what actually preserves daily/monthly representatives.
 func Select(backups []models.Backup, p Policy, now time.Time) (keep map[int64]bool) {
 	keep = map[int64]bool{}
 	if len(backups) == 0 {
@@ -46,23 +57,56 @@ func Select(backups []models.Backup, p Policy, now time.Time) (keep map[int64]bo
 		return sorted[i].CreatedAt.After(sorted[j].CreatedAt)
 	})
 
-	apply := func(window time.Duration, count int) {
-		if count <= 0 {
-			return
-		}
+	inWindow := func(b models.Backup, window time.Duration) bool {
+		return now.Sub(b.CreatedAt) <= window
+	}
+
+	// Tier 1: N newest within window.
+	if p.Hourly.Count > 0 {
 		n := 0
 		for _, b := range sorted {
-			if now.Sub(b.CreatedAt) <= window {
-				if n < count {
+			if inWindow(b, p.Hourly.Window) {
+				if n < p.Hourly.Count {
 					keep[b.ID] = true
 					n++
 				}
 			}
 		}
 	}
-	apply(p.Hourly.Window, p.Hourly.Count)
-	apply(p.Weekly.Window, p.Weekly.Count)
-	apply(p.Monthly.Window, p.Monthly.Count)
+
+	// Tiers 2-3: newest per time bucket within window, skipping kept.
+	dayKey := func(b models.Backup) string {
+		t := b.CreatedAt.UTC()
+		return t.Format("2006-01-02")
+	}
+	monthKey := func(b models.Backup) string {
+		t := b.CreatedAt.UTC()
+		return t.Format("2006-01")
+	}
+	perBucket := func(window time.Duration, count int, key func(models.Backup) string) {
+		if count <= 0 {
+			return
+		}
+		seen := map[string]bool{}
+		buckets := 0
+		for _, b := range sorted {
+			if keep[b.ID] || !inWindow(b, window) {
+				continue
+			}
+			k := key(b)
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+			keep[b.ID] = true
+			buckets++
+			if buckets >= count {
+				break
+			}
+		}
+	}
+	perBucket(p.Weekly.Window, p.Weekly.Count, dayKey)
+	perBucket(p.Monthly.Window, p.Monthly.Count, monthKey)
 	// Edge: if total backups fewer than protection, Select naturally keeps subset;
 	// but always keep the newest one to avoid deleting everything.
 	if len(keep) == 0 && len(sorted) > 0 {
